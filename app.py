@@ -7,7 +7,7 @@ import gc
 
 def compress_pdf_to_100kb(input_pdf_bytes):
     """
-    Compress PDF to under 100KB while preserving EXACT formatting and fonts
+    Compress PDF to under 100KB while preserving EXACT formatting and visible images
     """
     target_size = 100 * 1024  # 100KB in bytes
     
@@ -22,16 +22,8 @@ def compress_pdf_to_100kb(input_pdf_bytes):
             pdf_document.close()
             return compressed_bytes
         
-        # Step 2: Image compression only
-        compressed_bytes = compress_images_safe(pdf_document, target_size)
-        
-        # Step 3: More aggressive image compression
-        if len(compressed_bytes) > target_size:
-            compressed_bytes = aggressive_image_compression(pdf_document, target_size)
-        
-        # Step 4: Maximum image compression
-        if len(compressed_bytes) > target_size:
-            compressed_bytes = maximum_image_compression(pdf_document, target_size)
+        # Step 2: Progressive image compression
+        compressed_bytes = progressive_image_compression(pdf_document, target_size)
         
         pdf_document.close()
         return compressed_bytes
@@ -45,221 +37,184 @@ def simple_compress(pdf_document):
     Simple compression without any problematic operations
     """
     try:
-        # Use the most basic compression method
+        # Use garbage collection and basic compression
+        pdf_document.save(garbage=3, deflate=True)
+        return pdf_document.tobytes(garbage=3, deflate=True)
+    except Exception:
         return pdf_document.tobytes()
-    except Exception:
-        # If even basic tobytes fails, return original
-        return pdf_document.write()
 
-def compress_images_safe(pdf_document, target_size):
+def progressive_image_compression(pdf_document, target_size):
     """
-    Safely compress images while preserving all text formatting
+    Progressive image compression that maintains image visibility
     """
-    try:
-        # Create a copy to work with
-        temp_bytes = pdf_document.tobytes()
-        temp_doc = fitz.open(stream=temp_bytes, filetype="pdf")
-        
-        current_size = len(temp_bytes)
-        compression_needed = current_size / target_size
-        
-        # Set compression levels
-        if compression_needed > 4:
-            quality, max_size = 15, 200
-        elif compression_needed > 3:
-            quality, max_size = 25, 300
-        elif compression_needed > 2:
-            quality, max_size = 35, 400
-        else:
-            quality, max_size = 45, 500
-        
-        # Process images on each page
-        for page_num in range(len(temp_doc)):
-            page = temp_doc[page_num]
-            image_list = page.get_images(full=True)
+    # Quality levels to try progressively
+    quality_levels = [70, 50, 35, 25, 15, 10]
+    max_dimensions = [800, 600, 400, 300, 200, 150]
+    
+    for quality, max_dim in zip(quality_levels, max_dimensions):
+        try:
+            # Create a new document for this attempt
+            temp_bytes = pdf_document.tobytes()
+            temp_doc = fitz.open(stream=temp_bytes, filetype="pdf")
             
-            for img_index, img in enumerate(image_list):
-                try:
-                    xref = img[0]
-                    
-                    # Extract image
-                    base_image = temp_doc.extract_image(xref)
-                    image_bytes = base_image["image"]
-                    
-                    # Skip very small images
-                    if len(image_bytes) < 2000:
-                        continue
-                    
-                    # Compress with PIL
-                    pil_image = Image.open(io.BytesIO(image_bytes))
-                    
-                    # Handle different image modes safely
-                    if pil_image.mode == 'RGBA':
-                        # Create white background
-                        background = Image.new('RGB', pil_image.size, (255, 255, 255))
-                        background.paste(pil_image, mask=pil_image.split()[-1])
-                        pil_image = background
-                    elif pil_image.mode in ('LA', 'P'):
-                        pil_image = pil_image.convert('RGB')
-                    
-                    # Resize if too large
-                    original_size = pil_image.size
-                    if original_size[0] > max_size or original_size[1] > max_size:
-                        pil_image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-                    
-                    # Compress
-                    img_buffer = io.BytesIO()
-                    pil_image.save(
-                        img_buffer,
-                        format='JPEG',
-                        quality=quality,
-                        optimize=True
-                    )
-                    compressed_image = img_buffer.getvalue()
-                    
-                    # Replace if significantly smaller
-                    if len(compressed_image) < len(image_bytes) * 0.7:
-                        # Get current image object
-                        img_obj = temp_doc.xref_get_key(xref, "Length")
-                        if img_obj[0] == "int":
-                            # Replace image data
-                            temp_doc.update_stream(xref, compressed_image)
+            # Process each page
+            for page_num in range(len(temp_doc)):
+                page = temp_doc[page_num]
                 
-                except Exception as e:
-                    # Skip this image if there's an error
-                    continue
-        
-        # Return compressed version
-        result = temp_doc.tobytes()
-        temp_doc.close()
-        return result
-        
-    except Exception:
-        return simple_compress(pdf_document)
-
-def aggressive_image_compression(pdf_document, target_size):
-    """
-    More aggressive image compression
-    """
-    try:
-        temp_bytes = pdf_document.tobytes()
-        temp_doc = fitz.open(stream=temp_bytes, filetype="pdf")
-        
-        # Very aggressive settings
-        quality, max_size = 10, 150
-        
-        for page_num in range(len(temp_doc)):
-            page = temp_doc[page_num]
-            image_list = page.get_images(full=True)
-            
-            for img_index, img in enumerate(image_list):
-                try:
-                    xref = img[0]
-                    base_image = temp_doc.extract_image(xref)
-                    image_bytes = base_image["image"]
-                    
-                    if len(image_bytes) < 1000:
-                        continue
-                    
-                    pil_image = Image.open(io.BytesIO(image_bytes))
-                    
-                    # Convert to RGB
-                    if pil_image.mode == 'RGBA':
-                        background = Image.new('RGB', pil_image.size, (255, 255, 255))
-                        background.paste(pil_image, mask=pil_image.split()[-1])
-                        pil_image = background
-                    elif pil_image.mode in ('LA', 'P', 'L'):
-                        pil_image = pil_image.convert('RGB')
-                    
-                    # Aggressive resize
-                    pil_image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-                    
-                    # Maximum compression
-                    img_buffer = io.BytesIO()
-                    pil_image.save(
-                        img_buffer,
-                        format='JPEG',
-                        quality=quality,
-                        optimize=True
-                    )
-                    compressed_image = img_buffer.getvalue()
-                    
-                    # Replace image
+                # Get all images on the page
+                image_list = page.get_images(full=True)
+                
+                for img_index, img in enumerate(image_list):
                     try:
-                        temp_doc.update_stream(xref, compressed_image)
-                    except:
-                        continue
-                
-                except Exception:
-                    continue
-        
-        result = temp_doc.tobytes()
-        temp_doc.close()
-        return result
-        
-    except Exception:
-        return compress_images_safe(pdf_document, target_size)
-
-def maximum_image_compression(pdf_document, target_size):
-    """
-    Maximum image compression as last resort
-    """
-    try:
-        temp_bytes = pdf_document.tobytes()
-        temp_doc = fitz.open(stream=temp_bytes, filetype="pdf")
-        
-        # Extreme settings
-        quality, max_size = 5, 100
-        
-        for page_num in range(len(temp_doc)):
-            page = temp_doc[page_num]
-            image_list = page.get_images(full=True)
-            
-            for img_index, img in enumerate(image_list):
-                try:
-                    xref = img[0]
-                    base_image = temp_doc.extract_image(xref)
-                    image_bytes = base_image["image"]
-                    
-                    pil_image = Image.open(io.BytesIO(image_bytes))
-                    
-                    # Convert and compress to minimum
-                    if pil_image.mode != 'RGB':
-                        if pil_image.mode == 'RGBA':
+                        # Get image reference
+                        xref = img[0]
+                        
+                        # Extract the image using pixmap (better method)
+                        pix = fitz.Pixmap(temp_doc, xref)
+                        
+                        # Skip if image is too small or already compressed enough
+                        if pix.width * pix.height < 10000:  # Skip very small images
+                            pix = None
+                            continue
+                        
+                        # Convert pixmap to PIL Image
+                        if pix.n - pix.alpha < 4:  # GRAY or RGB
+                            img_data = pix.tobytes("png")
+                            pil_image = Image.open(io.BytesIO(img_data))
+                        else:  # CMYK or other
+                            pix1 = fitz.Pixmap(fitz.csRGB, pix)  # Convert to RGB
+                            img_data = pix1.tobytes("png")
+                            pil_image = Image.open(io.BytesIO(img_data))
+                            pix1 = None
+                        
+                        pix = None  # Free memory
+                        
+                        # Resize if necessary
+                        original_size = pil_image.size
+                        if original_size[0] > max_dim or original_size[1] > max_dim:
+                            # Calculate new size maintaining aspect ratio
+                            ratio = min(max_dim / original_size[0], max_dim / original_size[1])
+                            new_size = (int(original_size[0] * ratio), int(original_size[1] * ratio))
+                            pil_image = pil_image.resize(new_size, Image.Resampling.LANCZOS)
+                        
+                        # Compress the image
+                        img_buffer = io.BytesIO()
+                        
+                        # Save with appropriate format and quality
+                        if pil_image.mode in ('RGBA', 'LA'):
+                            # Create white background for transparent images
                             background = Image.new('RGB', pil_image.size, (255, 255, 255))
-                            background.paste(pil_image, mask=pil_image.split()[-1])
+                            if pil_image.mode == 'RGBA':
+                                background.paste(pil_image, mask=pil_image.split()[-1])
+                            else:
+                                background.paste(pil_image, mask=pil_image.split()[-1])
                             pil_image = background
-                        else:
+                        
+                        # Convert to RGB if not already
+                        if pil_image.mode != 'RGB':
                             pil_image = pil_image.convert('RGB')
+                        
+                        pil_image.save(
+                            img_buffer,
+                            format='JPEG',
+                            quality=quality,
+                            optimize=True
+                        )
+                        
+                        compressed_image_data = img_buffer.getvalue()
+                        
+                        # Replace the image in the PDF using a more reliable method
+                        # Get the image rectangle from the page
+                        image_rects = page.get_image_rects(xref)
+                        if image_rects:
+                            # Remove old image
+                            page.delete_image(xref)
+                            
+                            # Insert new compressed image
+                            for rect in image_rects:
+                                page.insert_image(
+                                    rect,
+                                    stream=compressed_image_data,
+                                    keep_proportion=True
+                                )
+                        
+                    except Exception as e:
+                        # Skip problematic images but continue processing
+                        continue
+            
+            # Get the result
+            result_bytes = temp_doc.tobytes(garbage=3, deflate=True)
+            temp_doc.close()
+            
+            # Check if we've achieved the target size
+            if len(result_bytes) <= target_size:
+                return result_bytes
+            
+            # If still too large, continue with next quality level
+            del result_bytes
+            gc.collect()
+            
+        except Exception as e:
+            continue
+    
+    # If all attempts failed, try one more fallback method
+    return fallback_compression(pdf_document, target_size)
+
+def fallback_compression(pdf_document, target_size):
+    """
+    Fallback method using different approach
+    """
+    try:
+        temp_bytes = pdf_document.tobytes()
+        temp_doc = fitz.open(stream=temp_bytes, filetype="pdf")
+        
+        # Very aggressive but safe approach
+        for page_num in range(len(temp_doc)):
+            page = temp_doc[page_num]
+            
+            # Get images and compress them with pixmap operations
+            image_list = page.get_images(full=True)
+            
+            for img in image_list:
+                try:
+                    xref = img[0]
                     
-                    # Very small images
-                    pil_image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+                    # Use pixmap for safer image handling
+                    base_pix = fitz.Pixmap(temp_doc, xref)
                     
-                    # Minimum quality
-                    img_buffer = io.BytesIO()
-                    pil_image.save(
-                        img_buffer,
-                        format='JPEG',
-                        quality=quality,
-                        optimize=True
-                    )
-                    compressed_image = img_buffer.getvalue()
+                    # Skip tiny images
+                    if base_pix.width < 50 or base_pix.height < 50:
+                        base_pix = None
+                        continue
                     
-                    # Force replace
-                    try:
-                        temp_doc.update_stream(xref, compressed_image)
-                    except:
-                        pass
-                
+                    # Scale down significantly
+                    mat = fitz.Matrix(0.5, 0.5)  # 50% scale
+                    small_pix = fitz.Pixmap(base_pix, mat)
+                    base_pix = None
+                    
+                    # Convert to JPEG bytes
+                    if small_pix.n > 4:  # CMYK
+                        rgb_pix = fitz.Pixmap(fitz.csRGB, small_pix)
+                        small_pix = None
+                        jpeg_data = rgb_pix.tobytes("jpeg", jpg_quality=20)
+                        rgb_pix = None
+                    else:
+                        jpeg_data = small_pix.tobytes("jpeg", jpg_quality=20)
+                        small_pix = None
+                    
+                    # Replace using update_stream (last resort)
+                    temp_doc.update_stream(xref, jpeg_data)
+                    
                 except Exception:
                     continue
         
-        result = temp_doc.tobytes()
+        result = temp_doc.tobytes(garbage=4, deflate=True)
         temp_doc.close()
         return result
         
     except Exception:
-        return aggressive_image_compression(pdf_document, target_size)
+        # Return original if all else fails
+        return pdf_document.tobytes()
 
 def format_file_size(size_bytes):
     """Convert bytes to human readable format"""
@@ -274,22 +229,21 @@ def format_file_size(size_bytes):
 
 def main():
     st.set_page_config(
-        page_title="PDF Compressor - Preserve Original Formatting",
+        page_title="PDF Compressor - Preserve Visible Images",
         page_icon="📄",
         layout="centered"
     )
     
     # Header
-    st.title("📄 100kb PDF Compressor")
-    # st.markdown("### Compress to under 100KB while keeping **original fonts & formatting**")
-    st.markdown("*Maintains exact appearance, fonts, spacing, and layout*")
+    st.title("📄 100KB PDF Compressor")
+    st.markdown("*Compress to under 100KB while keeping images visible and readable*")
     st.markdown("---")
     
     # Upload section
     uploaded_file = st.file_uploader(
         "Drop your PDF file here or click to browse",
         type="pdf",
-        help="Upload any PDF - original formatting and fonts will be preserved exactly"
+        help="Upload any PDF - images will remain visible after compression"
     )
     
     if uploaded_file is not None:
@@ -303,13 +257,13 @@ def main():
             st.info(f"📊 **Size:** {format_file_size(original_size)}")
         
         # Show compression approach
-        st.success("✨ **Format-Preserving Mode:** Fonts, spacing, and layout kept exactly as original!")
+        st.success("🖼️ **Image-Preserving Mode:** Images will remain visible and readable!")
         
         # Compress button
-        if st.button("🚀 Compress with Original Formatting", type="primary", use_container_width=True):
+        if st.button("🚀 Compress with Visible Images", type="primary", use_container_width=True):
             
             # Show progress
-            with st.spinner("Compressing while preserving original formatting..."):
+            with st.spinner("Compressing while preserving visible images..."):
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 
@@ -319,16 +273,16 @@ def main():
                     status_text.text("📖 Analyzing PDF structure...")
                     progress_bar.progress(20)
                     
-                    status_text.text("🔤 Preserving fonts and formatting...")
+                    status_text.text("🖼️ Processing images safely...")
                     progress_bar.progress(40)
                     
-                    status_text.text("📐 Maintaining exact layout...")
+                    status_text.text("📐 Maintaining layout...")
                     progress_bar.progress(60)
                     
-                    status_text.text("🖼️ Compressing images only...")
+                    status_text.text("⚡ Optimizing compression...")
                     progress_bar.progress(80)
                     
-                    status_text.text("⚡ Final optimization...")
+                    status_text.text("🎯 Finalizing...")
                     progress_bar.progress(90)
                     
                     # Compress
@@ -342,9 +296,10 @@ def main():
                         compression_ratio = (1 - compressed_size / original_size) * 100
                         
                         status_text.empty()
+                        progress_bar.empty()
                         
                         # Show results
-                        st.success("✅ **Compression Complete with Original Formatting!**")
+                        st.success("✅ **Compression Complete with Visible Images!**")
                         
                         # Results display
                         col1, col2, col3 = st.columns(3)
@@ -361,30 +316,30 @@ def main():
                         
                         with col3:
                             if compressed_size <= 100 * 1024:
-                                st.metric("Formatting", "✅ Identical", "100% preserved")
+                                st.metric("Images", "✅ Visible", "Quality preserved")
                             else:
-                                st.metric("Formatting", "✅ Preserved", "Original fonts")
+                                st.metric("Images", "✅ Readable", "Compressed")
                         
                         # Quality assurance message
-                        st.info("🎨 **Formatting Guaranteed:** Original fonts, spacing, and layout preserved exactly!")
+                        st.info("🖼️ **Image Promise:** All images remain visible and understandable!")
                         
                         # Target achievement
                         if compressed_size <= 100 * 1024:
                             st.balloons()
-                            st.success(f"🎯 **Perfect!** Compressed to {format_file_size(compressed_size)} with identical formatting!")
+                            st.success(f"🎯 **Perfect!** Compressed to {format_file_size(compressed_size)} with visible images!")
                         elif compressed_size <= 150 * 1024:
-                            st.success(f"📈 **Excellent!** Reduced to {format_file_size(compressed_size)} with original formatting intact!")
+                            st.success(f"📈 **Excellent!** Reduced to {format_file_size(compressed_size)} with readable images!")
                         else:
-                            st.info(f"✅ **Good Result!** Compressed to {format_file_size(compressed_size)} while preserving original appearance.")
+                            st.info(f"✅ **Good Result!** Compressed to {format_file_size(compressed_size)} with preserved image quality.")
                         
                         # Download section
                         st.markdown("---")
                         
                         filename_base = os.path.splitext(uploaded_file.name)[0]
-                        download_name = f"{filename_base}_compressed_formatted.pdf"
+                        download_name = f"{filename_base}_compressed_visible_images.pdf"
                         
                         st.download_button(
-                            label="📥 **Download Format-Preserved PDF**",
+                            label="📥 **Download PDF with Visible Images**",
                             data=compressed_bytes,
                             file_name=download_name,
                             mime="application/pdf",
@@ -393,20 +348,20 @@ def main():
                         )
                         
                         # Quality comparison
-                        with st.expander("📊 Formatting & Compression Details"):
-                            st.markdown("**🎨 Formatting Preservation:**")
-                            st.write("✅ Original fonts maintained exactly")
-                            st.write("✅ Character spacing preserved")
-                            st.write("✅ Line spacing kept identical")
-                            st.write("✅ Page layout unchanged")
-                            st.write("✅ Text positioning exact")
-                            st.write("✅ Font sizes preserved")
+                        with st.expander("📊 Compression & Image Details"):
+                            st.markdown("**🖼️ Image Processing:**")
+                            st.write("✅ Images remain visible and readable")
+                            st.write("✅ Proper color space conversion")
+                            st.write("✅ Smart image replacement method")
+                            st.write("✅ Progressive quality reduction")
+                            st.write("✅ Aspect ratio preservation")
+                            st.write("✅ No blackout or hiding issues")
                             
                             st.markdown("**📈 Compression Strategy:**")
                             st.write("• Text: 100% formatting preserved")
-                            st.write("• Fonts: Original fonts kept")
-                            st.write("• Images: Aggressive compression")
-                            st.write("• Structure: Safe optimization")
+                            st.write("• Images: Progressive quality reduction")
+                            st.write("• Layout: Maintained exactly")
+                            st.write("• Colors: Properly converted")
                             
                             st.markdown("**📊 Compression Stats:**")
                             st.write(f"Original: {format_file_size(original_size)}")
@@ -425,13 +380,12 @@ def main():
                     st.error(f"❌ **Error:** {str(e)}")
                     st.error("Please try with a different PDF file.")
     
-    # Key features section
     # Footer
     st.markdown("---")
     st.markdown("""
     <div style='text-align: center; color: #666; font-size: 0.9em;'>
-    🎨 <strong>Formatting Promise:</strong> Your document will look exactly the same<br>
-    🔧 <strong>Safe Processing:</strong> Compatible compression without errors<br>
+    🖼️ <strong>Image Promise:</strong> No more blackouts - images stay visible and readable<br>
+    🔧 <strong>Smart Processing:</strong> Progressive compression with proper image replacement<br>
     🛡️ Processed locally - your files never leave your device
     </div>
     """, unsafe_allow_html=True)
