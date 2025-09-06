@@ -384,9 +384,8 @@ def main():
     st.markdown("---")
     st.markdown("""
     <div style='text-align: center; color: #666; font-size: 0.9em;'>
-    🖼️ <strong>Image Promise:</strong> No more blackouts - images stay visible and readable<br>
-    🔧 <strong>Smart Processing:</strong> Progressive compression with proper image replacement<br>
-    🛡️ Processed locally - your files never leave your device
+  Developed By <strong><a href="https://shreedhar.unaux.com/">Shreedhar</a></strong>
+
     </div>
     """, unsafe_allow_html=True)
 
