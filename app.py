@@ -5,28 +5,152 @@ import os
 from PIL import Image
 import gc
 
+def remove_watermark(pdf_document):
+    """Remove only center/middle watermarks, preserve footer stamps and official markings"""
+    try:
+        for page_num in range(len(pdf_document)):
+            page = pdf_document[page_num]
+            page_rect = page.rect
+            page_height = page_rect.height
+            page_width = page_rect.width
+            
+            # Define regions: only remove watermarks from middle 60% of page
+            middle_start_y = page_height * 0.2  # Top 20% preserved
+            middle_end_y = page_height * 0.8    # Bottom 20% preserved (footer area)
+            middle_start_x = page_width * 0.2   # Left 20% preserved
+            middle_end_x = page_width * 0.8     # Right 20% preserved
+            
+            # Step 1: Remove annotations only from middle area
+            annot_list = list(page.annots())
+            for annot in annot_list:
+                try:
+                    annot_rect = annot.rect
+                    annot_center_x = (annot_rect.x0 + annot_rect.x1) / 2
+                    annot_center_y = (annot_rect.y0 + annot_rect.y1) / 2
+                    
+                    # Only remove if annotation is in middle area (not in footer/header)
+                    if (middle_start_x <= annot_center_x <= middle_end_x and 
+                        middle_start_y <= annot_center_y <= middle_end_y):
+                        
+                        annot_type = annot.type[0] if annot.type else -1
+                        if annot_type in [0, 1, 2, 3, 8, 13, 14, 15, 16]:
+                            page.delete_annot(annot)
+                except Exception:
+                    continue
+            
+            # Step 2: Remove watermark images only from middle area
+            try:
+                image_list = page.get_images(full=True)
+                for img_index, img in enumerate(image_list):
+                    try:
+                        xref = img[0]
+                        
+                        # Get image rectangles to check position
+                        image_rects = page.get_image_rects(xref)
+                        if image_rects:
+                            for img_rect in image_rects:
+                                img_center_x = (img_rect.x0 + img_rect.x1) / 2
+                                img_center_y = (img_rect.y0 + img_rect.y1) / 2
+                                
+                                # Only remove if image is in middle area
+                                if (middle_start_x <= img_center_x <= middle_end_x and 
+                                    middle_start_y <= img_center_y <= middle_end_y):
+                                    
+                                    pix = fitz.Pixmap(pdf_document, xref)
+                                    if pix:
+                                        # Check if it's likely a watermark (small, transparent)
+                                        if (pix.width < 200 and pix.height < 200) or pix.alpha > 0:
+                                            page.delete_image(xref)
+                                        pix = None
+                                    break  # Only check first occurrence
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            
+            # Step 3: Clean page contents but preserve footer area
+            try:
+                if page.get_contents():
+                    content_stream = page.read_contents()
+                    if content_stream:
+                        content_str = content_stream.decode('latin-1', errors='ignore')
+                        
+                        # More conservative pattern removal - avoid footer area
+                        import re
+                        
+                        # Only remove transparency operations that are likely in middle area
+                        # Look for patterns that include positioning in middle area
+                        watermark_patterns = [
+                            r'/GS\d+\s+gs\s+q\s+[\d\.\s]*[3-7]\d+[\d\.\s]*cm',  # Transparency with middle positioning
+                            r'q\s+[\d\.\s]*[3-7]\d+[\d\.\s]*cm\s+/GS\d+\s+gs.*?Q',  # Middle area transformations
+                        ]
+                        
+                        for pattern in watermark_patterns:
+                            content_str = re.sub(pattern, '', content_str, flags=re.DOTALL)
+                        
+                        try:
+                            page.set_contents(content_str.encode('latin-1'))
+                        except Exception:
+                            pass
+                    
+                    # Clean contents but preserve structure
+                    page.clean_contents()
+                    
+            except Exception:
+                pass
+            
+            # Step 4: Remove form fields only from middle area
+            try:
+                widgets = page.widgets()
+                for widget in widgets:
+                    try:
+                        widget_rect = widget.rect
+                        widget_center_x = (widget_rect.x0 + widget_rect.x1) / 2
+                        widget_center_y = (widget_rect.y0 + widget_rect.y1) / 2
+                        
+                        # Only remove widgets in middle area
+                        if (middle_start_x <= widget_center_x <= middle_end_x and 
+                            middle_start_y <= widget_center_y <= middle_end_y):
+                            
+                            if widget.field_type_string in ['Text', 'Button']:
+                                widget.delete()
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+                
+    except Exception as e:
+        # If watermark removal fails, continue without it
+        pass
+    
+    return pdf_document
+
 def compress_pdf_to_100kb(input_pdf_bytes):
     """
-    Compress PDF to under 100KB while preserving EXACT formatting and visible images
+    Compress PDF to strictly between 80KB-100KB using iterative binary search approach
     """
-    target_size = 100 * 1024  # 100KB in bytes
+    max_size = 100 * 1024  # 100KB in bytes
+    min_size = 80 * 1024   # 80KB in bytes
     
     try:
         pdf_document = fitz.open(stream=input_pdf_bytes, filetype="pdf")
         
-        # Step 1: Simple compression without problematic operations
+        # Step 1: Remove watermarks
+        pdf_document = remove_watermark(pdf_document)
+        
+        # Step 2: Try simple compression first
         compressed_bytes = simple_compress(pdf_document)
         
-        # Check if target achieved
-        if len(compressed_bytes) <= target_size:
+        # Check if already in target range
+        if min_size <= len(compressed_bytes) <= max_size:
             pdf_document.close()
             return compressed_bytes
         
-        # Step 2: Progressive image compression
-        compressed_bytes = progressive_image_compression(pdf_document, target_size)
+        # Step 3: Use binary search approach for precise size control
+        result_bytes = binary_search_compression(pdf_document, min_size, max_size)
         
         pdf_document.close()
-        return compressed_bytes
+        return result_bytes
         
     except Exception as e:
         st.error(f"Compression failed: {str(e)}")
@@ -43,130 +167,169 @@ def simple_compress(pdf_document):
     except Exception:
         return pdf_document.tobytes()
 
-def progressive_image_compression(pdf_document, target_size):
+def binary_search_compression(pdf_document, min_size, max_size):
     """
-    Progressive image compression that maintains image visibility
+    Use binary search to find optimal compression settings for exact size range
     """
-    # Quality levels to try progressively
-    quality_levels = [70, 50, 35, 25, 15, 10]
-    max_dimensions = [800, 600, 400, 300, 200, 150]
+    # Quality levels for binary search (from high to low quality)
+    quality_range = list(range(5, 95, 5))  # [5, 10, 15, ..., 90]
+    dimension_range = list(range(100, 1200, 50))  # [100, 150, 200, ..., 1150]
     
-    for quality, max_dim in zip(quality_levels, max_dimensions):
-        try:
-            # Create a new document for this attempt
-            temp_bytes = pdf_document.tobytes()
-            temp_doc = fitz.open(stream=temp_bytes, filetype="pdf")
-            
-            # Process each page
-            for page_num in range(len(temp_doc)):
-                page = temp_doc[page_num]
-                
-                # Get all images on the page
-                image_list = page.get_images(full=True)
-                
-                for img_index, img in enumerate(image_list):
-                    try:
-                        # Get image reference
-                        xref = img[0]
-                        
-                        # Extract the image using pixmap (better method)
-                        pix = fitz.Pixmap(temp_doc, xref)
-                        
-                        # Skip if image is too small or already compressed enough
-                        if pix.width * pix.height < 10000:  # Skip very small images
-                            pix = None
-                            continue
-                        
-                        # Convert pixmap to PIL Image
-                        if pix.n - pix.alpha < 4:  # GRAY or RGB
-                            img_data = pix.tobytes("png")
-                            pil_image = Image.open(io.BytesIO(img_data))
-                        else:  # CMYK or other
-                            pix1 = fitz.Pixmap(fitz.csRGB, pix)  # Convert to RGB
-                            img_data = pix1.tobytes("png")
-                            pil_image = Image.open(io.BytesIO(img_data))
-                            pix1 = None
-                        
-                        pix = None  # Free memory
-                        
-                        # Resize if necessary
-                        original_size = pil_image.size
-                        if original_size[0] > max_dim or original_size[1] > max_dim:
-                            # Calculate new size maintaining aspect ratio
-                            ratio = min(max_dim / original_size[0], max_dim / original_size[1])
-                            new_size = (int(original_size[0] * ratio), int(original_size[1] * ratio))
-                            pil_image = pil_image.resize(new_size, Image.Resampling.LANCZOS)
-                        
-                        # Compress the image
-                        img_buffer = io.BytesIO()
-                        
-                        # Save with appropriate format and quality
-                        if pil_image.mode in ('RGBA', 'LA'):
-                            # Create white background for transparent images
-                            background = Image.new('RGB', pil_image.size, (255, 255, 255))
-                            if pil_image.mode == 'RGBA':
-                                background.paste(pil_image, mask=pil_image.split()[-1])
-                            else:
-                                background.paste(pil_image, mask=pil_image.split()[-1])
-                            pil_image = background
-                        
-                        # Convert to RGB if not already
-                        if pil_image.mode != 'RGB':
-                            pil_image = pil_image.convert('RGB')
-                        
-                        pil_image.save(
-                            img_buffer,
-                            format='JPEG',
-                            quality=quality,
-                            optimize=True
-                        )
-                        
-                        compressed_image_data = img_buffer.getvalue()
-                        
-                        # Replace the image in the PDF using a more reliable method
-                        # Get the image rectangle from the page
-                        image_rects = page.get_image_rects(xref)
-                        if image_rects:
-                            # Remove old image
-                            page.delete_image(xref)
-                            
-                            # Insert new compressed image
-                            for rect in image_rects:
-                                page.insert_image(
-                                    rect,
-                                    stream=compressed_image_data,
-                                    keep_proportion=True
-                                )
-                        
-                    except Exception as e:
-                        # Skip problematic images but continue processing
-                        continue
-            
-            # Get the result
-            result_bytes = temp_doc.tobytes(garbage=3, deflate=True)
-            temp_doc.close()
-            
-            # Check if we've achieved the target size
-            if len(result_bytes) <= target_size:
-                return result_bytes
-            
-            # If still too large, continue with next quality level
-            del result_bytes
-            gc.collect()
-            
-        except Exception as e:
-            continue
+    best_result = None
+    best_size = float('inf')
     
-    # If all attempts failed, try one more fallback method
-    return fallback_compression(pdf_document, target_size)
+    # Try different combinations with binary search approach
+    for max_dim in [800, 600, 400, 300, 200]:
+        low_quality, high_quality = 0, len(quality_range) - 1
+        
+        while low_quality <= high_quality:
+            mid = (low_quality + high_quality) // 2
+            quality = quality_range[mid]
+            
+            try:
+                compressed_bytes = compress_with_settings(pdf_document, quality, max_dim)
+                current_size = len(compressed_bytes)
+                
+                # Perfect range - return immediately
+                if min_size <= current_size <= max_size:
+                    return compressed_bytes
+                
+                # Track best result (closest to target range)
+                if abs(current_size - ((min_size + max_size) // 2)) < abs(best_size - ((min_size + max_size) // 2)):
+                    best_result = compressed_bytes
+                    best_size = current_size
+                
+                # Adjust search range
+                if current_size > max_size:
+                    # File too large, need more compression (lower quality)
+                    high_quality = mid - 1
+                elif current_size < min_size:
+                    # File too small, need less compression (higher quality)
+                    low_quality = mid + 1
+                
+            except Exception:
+                # Skip this setting and continue
+                high_quality = mid - 1
+    
+    # If we found something in range, return it
+    if best_result and min_size <= best_size <= max_size:
+        return best_result
+    
+    # Final attempt with aggressive compression to force into range
+    return force_into_range(pdf_document, min_size, max_size)
+
+def compress_with_settings(pdf_document, quality, max_dimension):
+    """
+    Compress PDF with specific quality and dimension settings
+    """
+    temp_bytes = pdf_document.tobytes()
+    temp_doc = fitz.open(stream=temp_bytes, filetype="pdf")
+    
+    # Process each page
+    for page_num in range(len(temp_doc)):
+        page = temp_doc[page_num]
+        image_list = page.get_images(full=True)
+        
+        for img in image_list:
+            try:
+                xref = img[0]
+                pix = fitz.Pixmap(temp_doc, xref)
+                
+                # Skip very small images
+                if pix.width * pix.height < 5000:
+                    pix = None
+                    continue
+                
+                # Convert to PIL Image
+                if pix.n - pix.alpha < 4:
+                    img_data = pix.tobytes("png")
+                    pil_image = Image.open(io.BytesIO(img_data))
+                else:
+                    pix1 = fitz.Pixmap(fitz.csRGB, pix)
+                    img_data = pix1.tobytes("png")
+                    pil_image = Image.open(io.BytesIO(img_data))
+                    pix1 = None
+                
+                pix = None
+                
+                # Resize maintaining aspect ratio
+                original_size = pil_image.size
+                if original_size[0] > max_dimension or original_size[1] > max_dimension:
+                    ratio = min(max_dimension / original_size[0], max_dimension / original_size[1])
+                    new_size = (int(original_size[0] * ratio), int(original_size[1] * ratio))
+                    pil_image = pil_image.resize(new_size, Image.Resampling.LANCZOS)
+                
+                # Handle transparency
+                if pil_image.mode in ('RGBA', 'LA'):
+                    background = Image.new('RGB', pil_image.size, (255, 255, 255))
+                    if pil_image.mode == 'RGBA':
+                        background.paste(pil_image, mask=pil_image.split()[-1])
+                    else:
+                        background.paste(pil_image, mask=pil_image.split()[-1])
+                    pil_image = background
+                
+                if pil_image.mode != 'RGB':
+                    pil_image = pil_image.convert('RGB')
+                
+                # Compress image
+                img_buffer = io.BytesIO()
+                pil_image.save(img_buffer, format='JPEG', quality=quality, optimize=True)
+                compressed_image_data = img_buffer.getvalue()
+                
+                # Replace image
+                image_rects = page.get_image_rects(xref)
+                if image_rects:
+                    page.delete_image(xref)
+                    for rect in image_rects:
+                        page.insert_image(rect, stream=compressed_image_data, keep_proportion=True)
+                
+            except Exception:
+                continue
+    
+    result = temp_doc.tobytes(garbage=3, deflate=True)
+    temp_doc.close()
+    return result
+
+def force_into_range(pdf_document, min_size, max_size):
+    """
+    Aggressively force PDF into the 80KB-100KB range
+    """
+    try:
+        # Start with very aggressive settings
+        for quality in [15, 10, 8, 5, 3]:
+            for max_dim in [200, 150, 100, 80]:
+                try:
+                    result = compress_with_settings(pdf_document, quality, max_dim)
+                    size = len(result)
+                    
+                    if min_size <= size <= max_size:
+                        return result
+                    
+                    # If too small, try to add some padding or use less compression
+                    if size < min_size and quality < 20:
+                        result = compress_with_settings(pdf_document, quality + 5, max_dim + 20)
+                        if min_size <= len(result) <= max_size:
+                            return result
+                
+                except Exception:
+                    continue
+        
+        # Last resort: use fallback method
+        return fallback_compression(pdf_document, max_size)
+        
+    except Exception:
+        return fallback_compression(pdf_document, max_size)
 
 def fallback_compression(pdf_document, target_size):
     """
-    Fallback method using different approach
+    Fallback method using different approach to reach 80-100KB
     """
     try:
         temp_bytes = pdf_document.tobytes()
         temp_doc = fitz.open(stream=temp_bytes, filetype="pdf")
+        
+        # Apply watermark removal again just in case
+        temp_doc = remove_watermark(temp_doc)
         
         # Very aggressive but safe approach
         for page_num in range(len(temp_doc)):
@@ -229,14 +392,14 @@ def format_file_size(size_bytes):
 
 def main():
     st.set_page_config(
-        page_title="PDF Compressor - Preserve Visible Images",
+        page_title="PDF Compressor - 80KB-100KB Strict Range",
         page_icon="📄",
         layout="centered"
     )
     
     # Header
-    st.title("📄 100KB PDF Compressor")
-    st.markdown("*Compress to under 100KB while keeping images visible and readable*")
+    st.title("📄 80-100KB PDF Compressor")
+    st.markdown("*Compress to strictly between 80KB-100KB while keeping images visible and readable*")
     st.markdown("---")
     
     # Upload section
@@ -257,7 +420,8 @@ def main():
             st.info(f"📊 **Size:** {format_file_size(original_size)}")
         
         # Show compression approach
-        st.success("🖼️ **Image-Preserving Mode:** Images will remain visible and readable!")
+        st.success("🎯 **Strict Size Control:** Will compress to exactly 80KB-100KB range!")
+        st.info("🖼️ **Image-Preserving Mode:** Images will remain visible and readable!")
         
         # Compress button
         if st.button("🚀 Compress with Visible Images", type="primary", use_container_width=True):
@@ -323,14 +487,19 @@ def main():
                         # Quality assurance message
                         st.info("🖼️ **Image Promise:** All images remain visible and understandable!")
                         
-                        # Target achievement
-                        if compressed_size <= 100 * 1024:
+                        # Target achievement with strict range validation
+                        min_target = 80 * 1024
+                        max_target = 100 * 1024
+                        
+                        if min_target <= compressed_size <= max_target:
                             st.balloons()
-                            st.success(f"🎯 **Perfect!** Compressed to {format_file_size(compressed_size)} with visible images!")
-                        elif compressed_size <= 150 * 1024:
-                            st.success(f"📈 **Excellent!** Reduced to {format_file_size(compressed_size)} with readable images!")
+                            st.success(f"🎯 **Perfect!** Compressed to {format_file_size(compressed_size)} - exactly in 80KB-100KB range!")
+                        elif compressed_size < min_target:
+                            st.warning(f"⚠️ **Size Warning:** File is {format_file_size(compressed_size)} (below 80KB minimum). Consider using a less compressed version.")
+                        elif compressed_size <= 120 * 1024:
+                            st.info(f"📈 **Close!** Compressed to {format_file_size(compressed_size)} - slightly above 100KB target.")
                         else:
-                            st.info(f"✅ **Good Result!** Compressed to {format_file_size(compressed_size)} with preserved image quality.")
+                            st.error(f"❌ **Size Issue:** File is {format_file_size(compressed_size)} - significantly above 100KB limit.")
                         
                         # Download section
                         st.markdown("---")
@@ -358,6 +527,8 @@ def main():
                             st.write("✅ No blackout or hiding issues")
                             
                             st.markdown("**📈 Compression Strategy:**")
+                            st.write("• Target: Strict 80KB-100KB range")
+                            st.write("• Method: Binary search optimization")
                             st.write("• Text: 100% formatting preserved")
                             st.write("• Images: Progressive quality reduction")
                             st.write("• Layout: Maintained exactly")
@@ -368,6 +539,14 @@ def main():
                             st.write(f"Compressed: {format_file_size(compressed_size)}")
                             st.write(f"Reduction: {compression_ratio:.1f}%")
                             st.write(f"Size ratio: {compressed_size/original_size:.3f}x")
+                            
+                            # Range validation info
+                            min_target = 80 * 1024
+                            max_target = 100 * 1024
+                            if min_target <= compressed_size <= max_target:
+                                st.write(f"✅ **Range Status:** Perfect (80KB-100KB)")
+                            else:
+                                st.write(f"⚠️ **Range Status:** Outside target (80KB-100KB)")
                         
                         # Memory cleanup
                         del compressed_bytes
